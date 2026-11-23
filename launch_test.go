@@ -118,17 +118,34 @@ func TestShellInit(t *testing.T) {
 			t.Errorf("missing %q in:\n%s", line, out)
 		}
 	}
-	// Run the aliases in a real zsh with a stand-in command that prints each
+	// Run the aliases in real shells with a stand-in command that prints each
 	// argument it receives, so quoting of paths with spaces is checked end to end.
 	stub := "printf " + shellQuote("[%s]") + " " + shellQuote("/opt/llm relay/bin") + " -config " + shellQuote("/tmp/c d.yaml")
-	script := shellInit(cfg, stub) + "\neval 'ccl --model x'\necho\neval ccnext\n"
-	got, err := exec.Command("zsh", "-f", "-c", script).CombinedOutput()
-	if err != nil {
-		t.Fatalf("zsh rejected shell-init output: %v\n%s", err, got)
-	}
+	body := shellInit(cfg, stub) + "\neval 'ccl --model x'\necho\neval ccnext\n"
 	want := "[/opt/llm relay/bin][-config][/tmp/c d.yaml][run][ccl][--model][x]\n" +
 		"[/opt/llm relay/bin][-config][/tmp/c d.yaml][next]"
-	if string(got) != want {
-		t.Errorf("aliases expanded to\n%s\nwant\n%s", got, want)
+	ran := 0
+	for _, sh := range []struct{ name, prelude string }{
+		{"zsh", ""},
+		{"bash", "shopt -s expand_aliases\n"}, // non-interactive bash ignores aliases otherwise
+	} {
+		if _, err := exec.LookPath(sh.name); err != nil {
+			continue // CI images differ: macOS has zsh, Ubuntu runners only bash
+		}
+		ran++
+		args := []string{"-c", sh.prelude + body}
+		if sh.name == "zsh" {
+			args = append([]string{"-f"}, args...)
+		}
+		got, err := exec.Command(sh.name, args...).CombinedOutput()
+		if err != nil {
+			t.Fatalf("%s rejected shell-init output: %v\n%s", sh.name, err, got)
+		}
+		if string(got) != want {
+			t.Errorf("%s expanded the aliases to\n%s\nwant\n%s", sh.name, got, want)
+		}
+	}
+	if ran == 0 {
+		t.Fatal("neither zsh nor bash found; shell-init output is untested")
 	}
 }
