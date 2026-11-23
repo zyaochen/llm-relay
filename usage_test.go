@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 const (
@@ -94,6 +95,11 @@ func TestRelayLogsUsageForStats(t *testing.T) {
 			t.Fatal(err)
 		}
 		resp.Body.Close()
+	}
+	// The JSON reply has a Content-Length, so the client can finish reading
+	// before the relay has logged it.
+	if !waitUntil(5*time.Second, func() bool { return logs.count("msg=proxied") == 2 }) {
+		t.Fatalf("expected two proxied lines:\n%s", logs.String())
 	}
 
 	agg := newStatsAgg()
