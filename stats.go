@@ -84,6 +84,10 @@ type modelStats struct {
 	ok, failed int
 	ms         []float64 // request duration, successful requests
 	waits      []float64 // seconds waited for a provider slot
+
+	// token usage, from replies whose usage the relay read (Messages API)
+	replies                        int
+	in, out, cacheRead, cacheWrite int64
 }
 
 type providerStats struct {
@@ -182,6 +186,24 @@ func (a *statsAgg) add(kv map[string]string) {
 	case msg == "network outage: holding request":
 		a.outages++
 	}
+	if _, ok := kv["cache_read"]; ok {
+		a.addTokens(kv)
+	}
+}
+
+// addTokens counts a reply's usage; lost streams count too, their input was
+// already processed upstream.
+func (a *statsAgg) addTokens(kv map[string]string) {
+	n := func(k string) int64 {
+		v, _ := strconv.ParseInt(kv[k], 10, 64)
+		return v
+	}
+	m := a.model(kv["model"])
+	m.replies++
+	m.in += n("in")
+	m.out += n("out")
+	m.cacheRead += n("cache_read")
+	m.cacheWrite += n("cache_write")
 }
 
 func (a *statsAgg) addProxied(kv map[string]string) {
@@ -228,6 +250,9 @@ func (a *statsAgg) render(w io.Writer, since time.Duration) error {
 		return err
 	}
 	fmt.Fprintln(w)
+	if err := a.renderTokens(w); err != nil {
+		return err
+	}
 	if err := a.renderProviders(w); err != nil {
 		return err
 	}
@@ -254,6 +279,52 @@ func (a *statsAgg) renderModels(w io.Writer) error {
 			time.Duration(sum(m.waits)*float64(time.Second)).Round(time.Second))
 	}
 	return tw.Flush()
+}
+
+// renderTokens shows token usage per model. Cache hit is the share of prompt
+// tokens served from the prompt cache; input excludes cached tokens, as in the
+// Messages API usage.
+func (a *statsAgg) renderTokens(w io.Writer) error {
+	var names []string
+	for n, m := range a.models {
+		if m.replies > 0 {
+			names = append(names, n)
+		}
+	}
+	if len(names) == 0 {
+		return nil
+	}
+	sort.Slice(names, func(i, j int) bool {
+		mi, mj := a.models[names[i]], a.models[names[j]]
+		return mi.in+mi.cacheRead+mi.cacheWrite > mj.in+mj.cacheRead+mj.cacheWrite
+	})
+	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(tw, "MODEL\tREPLIES\tINPUT\tCACHE WRITE\tCACHE READ\tOUTPUT\tCACHE HIT")
+	for _, n := range names {
+		m := a.models[n]
+		hit := "-"
+		if prompt := m.in + m.cacheRead + m.cacheWrite; prompt > 0 {
+			hit = fmt.Sprintf("%.0f%%", float64(m.cacheRead)*100/float64(prompt))
+		}
+		fmt.Fprintf(tw, "%s\t%d\t%s\t%s\t%s\t%s\t%s\n", n, m.replies, tokenCount(m.in),
+			tokenCount(m.cacheWrite), tokenCount(m.cacheRead), tokenCount(m.out), hit)
+	}
+	if err := tw.Flush(); err != nil {
+		return err
+	}
+	_, err := fmt.Fprintln(w)
+	return err
+}
+
+// tokenCount prints n as 950, 12.3k or 4.56M.
+func tokenCount(n int64) string {
+	switch {
+	case n >= 1_000_000:
+		return fmt.Sprintf("%.2fM", float64(n)/1e6)
+	case n >= 1000:
+		return fmt.Sprintf("%.1fk", float64(n)/1e3)
+	}
+	return strconv.FormatInt(n, 10)
 }
 
 func (a *statsAgg) renderProviders(w io.Writer) error {

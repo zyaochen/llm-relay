@@ -31,6 +31,12 @@ func (s *syncBuffer) count(sub string) int {
 	return strings.Count(s.b.String(), sub)
 }
 
+func (s *syncBuffer) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.String()
+}
+
 func TestDiscoveryBacksOffAndLogsOncePerStreak(t *testing.T) {
 	var failing atomic.Bool
 	failing.Store(true)

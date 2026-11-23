@@ -338,16 +338,30 @@ func (s *Server) relay(w http.ResponseWriter, r *http.Request, resp *http.Respon
 		attrs = append(attrs, "failover", strings.Join(trail, " > "))
 	}
 	var err error
+	var u tokenUsage
 	if messages {
-		err = relayMessagesSSE(w, resp.Body, cool)
+		err = relayMessagesSSE(w, resp.Body, cool, &u)
 	} else {
+		var reply []byte
+		keep := isMessagesJSON(r, resp)
 		err = stream(w, resp.Body, func(b []byte) {
+			if keep {
+				if len(reply)+len(b) > maxUsageBody {
+					keep, reply = false, nil
+				} else {
+					reply = append(reply, b...)
+				}
+			}
 			if bytes.Contains(b, []byte("event: error")) && streamErrRe.Match(b) {
 				cool()
 			}
 		})
+		if keep && err == nil {
+			u.addJSON(reply)
+		}
 	}
 	attrs = append(attrs, "ms", time.Since(start).Milliseconds())
+	attrs = append(attrs, u.attrs()...)
 	s.logRelayEnd(r, err, messages, attrs)
 }
 

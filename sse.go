@@ -39,11 +39,11 @@ func isMessagesStream(r *http.Request, resp *http.Response) bool {
 		(enc == "" || strings.EqualFold(enc, "identity"))
 }
 
-// relayMessagesSSE forwards body event by event. It returns nil once
-// message_stop has been forwarded, a clientWriteError if the client went away,
-// and otherwise the reason the upstream stream broke (the response is then
-// left to end cleanly, with no completed block delivered).
-func relayMessagesSSE(w http.ResponseWriter, body io.Reader, onErrorEvent func()) error {
+// relayMessagesSSE forwards body event by event, recording token usage in u.
+// It returns nil once message_stop has been forwarded, a clientWriteError if
+// the client went away, and otherwise the reason the upstream stream broke
+// (the response is then left to end cleanly, with no completed block delivered).
+func relayMessagesSSE(w http.ResponseWriter, body io.Reader, onErrorEvent func(), u *tokenUsage) error {
 	rc := http.NewResponseController(w)
 	write := func(b []byte) error {
 		if _, err := w.Write(b); err != nil {
@@ -66,7 +66,11 @@ func relayMessagesSSE(w http.ResponseWriter, body io.Reader, onErrorEvent func()
 				break
 			}
 			ev := pending[:end]
-			switch sseEventName(ev) {
+			name := sseEventName(ev)
+			if name == "message_start" || name == "message_delta" {
+				u.addJSON(sseData(ev))
+			}
+			switch name {
 			case "content_block_stop":
 				held = append(held, ev...)
 			case "message_delta", "message_stop":
@@ -74,7 +78,7 @@ func relayMessagesSSE(w http.ResponseWriter, body io.Reader, onErrorEvent func()
 					return err
 				}
 				held = nil
-				if sseEventName(ev) == "message_stop" {
+				if name == "message_stop" {
 					return nil
 				}
 			case "error":
