@@ -221,7 +221,7 @@ never leave it.
 
 | Symptom | Check |
 |---|---|
-| `relay not reachable` | macOS: `launchctl kickstart -k gui/$(id -u)/io.github.chenziyaos.llm-relay`; Linux: `systemctl --user restart llm-relay`; if not installed, `llm-relay install-agent` |
+| `relay not reachable` | macOS: `launchctl kickstart -k gui/$(id -u)/io.github.zyaochen.llm-relay`; Linux: `systemctl --user restart llm-relay`; if not installed, `llm-relay install-agent` |
 | slow or failing answers | `llm-relay stats [-since 24h]`: per-model latency (p50/p90) and slot waits, per-provider 429/5xx/524, failovers, retries, mid-stream losses, and how many answers may have been billed twice |
 | `no provider serves model` | `llm-relay routes`; add a `routes` entry or `default_provider` |
 | stuck on the backup gateway | `llm-relay routes` shows `[cooling …]`; `llm-relay reset` |

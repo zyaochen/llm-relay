@@ -27,7 +27,7 @@ import (
 )
 
 const (
-	agentLabel = "io.github.chenziyaos.llm-relay"
+	agentLabel = "io.github.zyaochen.llm-relay"
 	usage      = `usage: llm-relay [-config path] <command>
 
 launching (presets live in the config):
