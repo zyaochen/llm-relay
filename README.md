@@ -94,8 +94,9 @@ routes:
 ```
 
 A second key for the same gateway counts as a second provider: same
-`base_url`, its own `auth` and `max_concurrent`. That doubles the concurrency
-cap as well as giving the model somewhere to fail over to.
+`base_url`, its own `auth` and `max_concurrent`. It gives the model somewhere
+to fail over to; it does not add concurrency yet — requests queue for the first
+provider's slots and only move to the second when the first fails.
 
 ## Lossy networks
 
@@ -222,7 +223,7 @@ never leave it.
 | Symptom | Check |
 |---|---|
 | `relay not reachable` | macOS: `launchctl kickstart -k gui/$(id -u)/io.github.zyaochen.llm-relay`; Linux: `systemctl --user restart llm-relay`; if not installed, `llm-relay install-agent` |
-| slow or failing answers | `llm-relay stats [-since 24h]`: per-model latency (p50/p90) and slot waits, per-provider 429/5xx/524, failovers, retries, mid-stream losses, and how many answers may have been billed twice |
+| slow or failing answers | `llm-relay stats [-since 24h]`: per-model latency (p50/p90) and slot waits, per-model tokens (input, cache write/read, output, prompt cache hit rate; Messages API only), per-provider 429/5xx/524, failovers, retries, mid-stream losses, and how many answers may have been billed twice |
 | `no provider serves model` | `llm-relay routes`; add a `routes` entry or `default_provider` |
 | stuck on the backup gateway | `llm-relay routes` shows `[cooling …]`; `llm-relay reset` |
 | 401 from a gateway | credential command output: run the `auth.cmd` by hand |

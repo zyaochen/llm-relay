@@ -36,7 +36,7 @@ func TestRelayMessagesSSEDefersBlockStops(t *testing.T) {
 		ssev("content_block_start") + ssev("content_block_delta") + ssev("content_block_stop") +
 		ssev("message_delta") + ssev("message_stop")
 	rec := httptest.NewRecorder()
-	if err := relayMessagesSSE(rec, &chunked{data: in, size: 7, err: io.EOF}, func() {}); err != nil {
+	if err := relayMessagesSSE(rec, &chunked{data: in, size: 7, err: io.EOF}, func() {}, &tokenUsage{}); err != nil {
 		t.Fatal(err)
 	}
 	want := ssev("message_start") + ssev("content_block_start") + ssev("content_block_delta") +
@@ -50,13 +50,13 @@ func TestRelayMessagesSSEDefersBlockStops(t *testing.T) {
 func TestRelayMessagesSSEOnLoss(t *testing.T) {
 	in := ssev("message_start") + ssev("content_block_start") + ssev("content_block_stop") + "event: content_block_d"
 	rec := httptest.NewRecorder()
-	err := relayMessagesSSE(rec, &chunked{data: in, size: 5, err: errors.New("read: connection reset")}, func() {})
+	err := relayMessagesSSE(rec, &chunked{data: in, size: 5, err: errors.New("read: connection reset")}, func() {}, &tokenUsage{})
 	if err == nil || strings.Contains(rec.Body.String(), "content_block_stop") || strings.Contains(rec.Body.String(), "content_block_d\n") {
 		t.Fatalf("loss must report an error and deliver neither held stops nor partial events: %v %q", err, rec.Body.String())
 	}
 
 	rec = httptest.NewRecorder()
-	err = relayMessagesSSE(rec, &chunked{data: ssev("message_start") + ssev("content_block_stop"), size: 99, err: io.EOF}, func() {})
+	err = relayMessagesSSE(rec, &chunked{data: ssev("message_start") + ssev("content_block_stop"), size: 99, err: io.EOF}, func() {}, &tokenUsage{})
 	if !errors.Is(err, errStreamTruncated) || strings.Contains(rec.Body.String(), "content_block_stop") {
 		t.Fatalf("EOF before message_stop is a truncated stream: %v %q", err, rec.Body.String())
 	}
@@ -67,7 +67,7 @@ func TestRelayMessagesSSEErrorEvent(t *testing.T) {
 		"event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\"}}\n\n"
 	rec := httptest.NewRecorder()
 	called := false
-	err := relayMessagesSSE(rec, &chunked{data: in, size: 99, err: io.EOF}, func() { called = true })
+	err := relayMessagesSSE(rec, &chunked{data: in, size: 99, err: io.EOF}, func() { called = true }, &tokenUsage{})
 	if !errors.Is(err, errStreamErrorEvt) || !called || strings.Contains(rec.Body.String(), "overloaded") {
 		t.Fatalf("error event: err=%v cooled=%v body=%q", err, called, rec.Body.String())
 	}
