@@ -21,10 +21,11 @@ func restart(configPath string, args []string) error {
 		return err
 	}
 	idle, err := waitIdle(configPath, *wait, 500*time.Millisecond)
-	if err != nil {
-		return err
-	}
 	switch {
+	case err != nil:
+		// Not answering: nothing to cut, and this is exactly when a restart
+		// (or re-loading a job launchd lost) is needed.
+		fmt.Printf("relay not answering (%v); starting it\n", err)
 	case idle:
 		fmt.Println("no requests in flight; restarting")
 	case *force:

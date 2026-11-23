@@ -1,6 +1,8 @@
 package main
 
 import (
+	"log/slog"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -55,5 +57,30 @@ func TestWaitUntil(t *testing.T) {
 	}
 	if waitUntil(300*time.Millisecond, func() bool { return false }) {
 		t.Fatal("a condition that never holds must time out")
+	}
+}
+
+func TestAgentLogAppendsToTheRelayLog(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "logs", "relay.log")
+	orig := agentLogPath
+	agentLogPath = func() string { return path }
+	t.Cleanup(func() { agentLogPath = orig })
+	agentLog(slog.LevelWarn, "agent reload: bootstrap failed", "attempt", 2, "out", "5: Input/output error")
+	agentLog(slog.LevelInfo, "agent reload: bootstrapped", "attempt", 3)
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(raw)), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("want 2 lines, got %q", raw)
+	}
+	kv, err := parseLogLine(lines[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if kv["level"] != "WARN" || kv["msg"] != "agent reload: bootstrap failed" || kv["out"] != "5: Input/output error" ||
+		kv["source"] != "cli" || kv["time"] == "" {
+		t.Errorf("parsed %v", kv)
 	}
 }
