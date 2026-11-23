@@ -1,8 +1,10 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -127,7 +129,9 @@ func installAgent(configPath string, args []string) error {
 	if err != nil {
 		return err
 	}
+	agentLog(slog.LevelInfo, "agent install requested", "wait", *wait, "force", *force)
 	if idle, err := waitIdle(configPath, *wait, 500*time.Millisecond); err == nil && !idle && !*force {
+		agentLog(slog.LevelInfo, "agent install: relay still busy; not reinstalling", "waited", *wait)
 		return fmt.Errorf("relay still busy after %s; not reinstalling (try again, raise -wait, or add -force)", *wait)
 	} // err: relay not running, nothing to cut
 	if err := os.MkdirAll(filepath.Dir(spec.logFile), 0o700); err != nil {
@@ -146,44 +150,67 @@ func installAgent(configPath string, args []string) error {
 	}
 	healthy := func() bool { return call(configPath, "GET", "/relay/health", func([]byte) error { return nil }) == nil }
 	if !waitUntil(agentWait, healthy) {
+		agentLog(slog.LevelError, "agent install: relay not answering after reload", "after", agentWait)
 		return fmt.Errorf("agent installed but the relay is not answering after %s; check %s and run `%s`",
 			agentWait, spec.stderrFile, agentHint())
 	}
-	fmt.Printf("relay is answering; logs: %s (crashes: %s)\n", spec.logFile, spec.stderrFile)
+	agentLog(slog.LevelInfo, "agent install: relay is answering")
+	fmt.Printf("logs: %s (crashes: %s)\n", spec.logFile, spec.stderrFile)
 	return nil
 }
 
 func installLaunchd(spec agentSpec) error {
-	plistPath := filepath.Join(spec.home, "Library/LaunchAgents", agentLabel+".plist")
+	plistPath := launchdPlistPath(spec.home)
 	if err := os.WriteFile(plistPath, []byte(launchdPlist(spec)), 0o644); err != nil {
 		return err
 	}
-	domain := fmt.Sprintf("gui/%d", os.Getuid())
-	target := domain + "/" + agentLabel
+	agentLog(slog.LevelInfo, "agent reload: plist written", "plist", plistPath)
+	domain, target := launchdTarget()
 	// bootout fails when the agent is not loaded yet; that is the expected first-install case.
 	if out, err := exec.Command("launchctl", "bootout", target).CombinedOutput(); err != nil {
-		fmt.Fprintf(os.Stderr, "launchctl bootout (ok on first install): %s", out)
+		agentLog(slog.LevelInfo, "agent reload: bootout found nothing loaded (ok on first install)", "out", strings.TrimSpace(string(out)))
+	} else {
+		agentLog(slog.LevelInfo, "agent reload: bootout", "target", target)
 	}
 	// bootout returns before the job is gone; bootstrapping then fails with
 	// "5: Input/output error" and leaves no agent at all (seen: 1h43m without
 	// a relay). Wait for the old job to disappear, and retry the bootstrap.
 	if !waitUntil(agentWait, func() bool { return exec.Command("launchctl", "print", target).Run() != nil }) {
-		fmt.Fprintf(os.Stderr, "launchctl: %s still loaded after %s; bootstrapping anyway\n", target, agentWait)
+		agentLog(slog.LevelWarn, "agent reload: old job still loaded; bootstrapping anyway", "after", agentWait)
 	}
+	if err := bootstrapLaunchd(domain, plistPath); err != nil {
+		return err
+	}
+	fmt.Println("installed", plistPath)
+	return nil
+}
+
+func launchdPlistPath(home string) string {
+	return filepath.Join(home, "Library/LaunchAgents", agentLabel+".plist")
+}
+
+func launchdTarget() (domain, target string) {
+	domain = fmt.Sprintf("gui/%d", os.Getuid())
+	return domain, domain + "/" + agentLabel
+}
+
+// bootstrapLaunchd loads the agent, retrying while launchd is still tearing
+// down a previous instance, and logs every attempt.
+func bootstrapLaunchd(domain, plistPath string) error {
 	var out []byte
 	var err error
 	for attempt := 1; attempt <= agentBootstrapTries; attempt++ {
 		if out, err = exec.Command("launchctl", "bootstrap", domain, plistPath).CombinedOutput(); err == nil {
-			break
+			agentLog(slog.LevelInfo, "agent reload: bootstrapped", "attempt", attempt)
+			return nil
 		}
+		agentLog(slog.LevelWarn, "agent reload: bootstrap failed", "attempt", attempt, "err", err,
+			"out", strings.TrimSpace(string(out)))
 		time.Sleep(agentRetryPause)
 	}
-	if err != nil {
-		return fmt.Errorf("launchctl bootstrap failed %d times, the relay is NOT running; retry with "+
-			"`launchctl bootstrap %s %s`: %w: %s", agentBootstrapTries, domain, plistPath, err, out)
-	}
-	fmt.Println("installed", plistPath)
-	return nil
+	agentLog(slog.LevelError, "agent reload: bootstrap gave up; the relay is NOT running", "tries", agentBootstrapTries)
+	return fmt.Errorf("launchctl bootstrap failed %d times, the relay is NOT running; retry with "+
+		"`launchctl bootstrap %s %s`: %w: %s", agentBootstrapTries, domain, plistPath, err, out)
 }
 
 // Pacing for reloading an agent; vars for tests.
@@ -217,6 +244,8 @@ func installSystemd(spec agentSpec) error {
 	}
 	for _, args := range [][]string{{"daemon-reload"}, {"enable", systemdUnitName}, {"restart", systemdUnitName}} {
 		if out, err := exec.Command("systemctl", append([]string{"--user"}, args...)...).CombinedOutput(); err != nil {
+			agentLog(slog.LevelError, "agent reload: systemctl failed", "args", strings.Join(args, " "),
+				"err", err, "out", strings.TrimSpace(string(out)))
 			return fmt.Errorf("systemctl --user %s: %w: %s", strings.Join(args, " "), err, out)
 		}
 	}
@@ -244,21 +273,70 @@ func agentCommand(restart bool) (*exec.Cmd, error) {
 	return nil, fmt.Errorf("no service manager support on %s", runtime.GOOS)
 }
 
+// runAgent starts or restarts the installed agent. On macOS a job that is
+// not loaded at all (an interrupted reload) cannot be kickstarted, so it is
+// bootstrapped from its plist instead; RunAtLoad starts it.
 func runAgent(restart bool) error {
 	cmd, err := agentCommand(restart)
 	if err != nil {
 		return err
 	}
-	if out, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("%s: %w: %s", strings.Join(cmd.Args, " "), err, out)
+	agentLog(slog.LevelInfo, "agent: "+strings.Join(cmd.Args, " "))
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		return nil
 	}
-	return nil
+	agentLog(slog.LevelWarn, "agent: command failed", "err", err, "out", strings.TrimSpace(string(out)))
+	if runtime.GOOS == "darwin" {
+		if home, herr := os.UserHomeDir(); herr == nil {
+			plistPath := launchdPlistPath(home)
+			_, target := launchdTarget()
+			if _, serr := os.Stat(plistPath); serr == nil && exec.Command("launchctl", "print", target).Run() != nil {
+				agentLog(slog.LevelWarn, "agent: not loaded; bootstrapping from the plist", "plist", plistPath)
+				domain, _ := launchdTarget()
+				return bootstrapLaunchd(domain, plistPath)
+			}
+		}
+	}
+	return fmt.Errorf("%s: %w: %s", strings.Join(cmd.Args, " "), err, out)
 }
 
-// agentHint tells a user how to bring the relay back by hand.
+// agentHint tells a user how to bring the relay back by hand; restart also
+// re-loads an agent that launchd lost.
 func agentHint() string {
-	if cmd, err := agentCommand(true); err == nil {
-		return strings.Join(cmd.Args, " ")
+	if _, err := agentCommand(true); err == nil {
+		return "llm-relay restart"
 	}
 	return "llm-relay serve"
+}
+
+// agentLogPath is where agentLog appends; a var for tests.
+var agentLogPath = defaultLogPath
+
+// agentLog prints a service-manager action and appends it to the relay's own
+// log, so a reload that goes wrong can be traced after the terminal that ran
+// it is gone (on 2026-11-23 only "draining … drained" was left behind). The
+// relay's rotating writer counts only its own bytes, so these few lines at
+// most delay a rotation slightly.
+func agentLog(level slog.Level, msg string, args ...any) {
+	plain := func(_ []string, a slog.Attr) slog.Attr {
+		if a.Key == slog.TimeKey || a.Key == slog.LevelKey {
+			return slog.Attr{}
+		}
+		return a
+	}
+	slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{ReplaceAttr: plain})).Log(context.Background(), level, msg, args...)
+	path := agentLogPath()
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		fmt.Fprintln(os.Stderr, "llm-relay: cannot record this in the log:", err)
+		return
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "llm-relay: cannot record this in the log:", err)
+		return
+	}
+	defer f.Close()
+	slog.New(slog.NewTextHandler(f, nil)).Log(context.Background(), level, msg,
+		append(args, "source", "cli", "pid", os.Getpid())...)
 }
