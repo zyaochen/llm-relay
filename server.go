@@ -23,8 +23,6 @@ var drainTimeout = 90 * time.Second
 
 const (
 	configPollInterval = 2 * time.Second
-	discoveryInterval  = 10 * time.Minute
-	discoveryTimeout   = 30 * time.Second
 )
 
 type provider struct {
@@ -51,6 +49,7 @@ type Server struct {
 	activity   activity
 	active     atomic.Int32 // client requests being proxied right now
 	limits     limiters     // per-provider concurrency, outlives reloads
+	discovery  discoveries  // per-provider model polling pace, outlives reloads
 	// Network view for status: when an upstream last answered, and since when
 	// no provider has been reachable at all (0 = not in an outage).
 	lastUpstreamOK atomic.Int64
@@ -136,7 +135,7 @@ func (s *Server) Reload() error {
 	}
 	s.modTime = info.ModTime()
 	s.st.Store(st)
-	go s.discover(st)
+	go s.discover(st, true)
 	s.log.Info("config loaded", "path", s.configPath, "providers", len(cfg.Providers), "routes", len(cfg.Routes))
 	return nil
 }
@@ -159,29 +158,6 @@ func (s *Server) reloadIfChanged() {
 		s.modTime = info.ModTime() // don't re-log the same broken file every poll
 		s.reloadMu.Unlock()
 	}
-}
-
-func (s *Server) discover(st *state) {
-	var wg sync.WaitGroup
-	for _, p := range st.providers {
-		if !p.cfg.discoverEnabled() {
-			continue
-		}
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			ctx, cancel := context.WithTimeout(context.Background(), discoveryTimeout)
-			defer cancel()
-			_, ids, err := s.fetchModels(ctx, p, "/v1/models")
-			if err != nil {
-				s.log.Warn("model discovery failed; keeping previous list", "provider", p.cfg.Name, "err", err)
-				return
-			}
-			st.router.SetDiscovered(p.cfg.Name, ids)
-			s.log.Info("models discovered", "provider", p.cfg.Name, "count", len(ids))
-		}()
-	}
-	wg.Wait()
 }
 
 // fetchModels GETs a provider's model list and returns raw entries plus ids.
@@ -233,7 +209,7 @@ func (s *Server) Run(ctx context.Context) error {
 	go s.keepWarm(ctx)
 	go func() {
 		poll := time.NewTicker(configPollInterval)
-		disc := time.NewTicker(discoveryInterval)
+		disc := time.NewTicker(discoveryTick)
 		defer poll.Stop()
 		defer disc.Stop()
 		for {
@@ -247,7 +223,7 @@ func (s *Server) Run(ctx context.Context) error {
 					s.log.Error("SIGHUP reload rejected; keeping running config", "err", err)
 				}
 			case <-disc.C:
-				s.discover(s.st.Load())
+				s.discover(s.st.Load(), false)
 			}
 		}
 	}()

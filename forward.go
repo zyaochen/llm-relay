@@ -39,24 +39,12 @@ func (s *Server) proxy(w http.ResponseWriter, r *http.Request, st *state) {
 	start := time.Now()
 	s.active.Add(1)
 	defer s.active.Add(-1)
-	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxRequestBody))
-	if err != nil {
-		writeError(w, http.StatusRequestEntityTooLarge, "relay: read body: "+err.Error())
+	body, reqModel, candidates, ok := readModelRequest(w, r, st)
+	if !ok {
 		return
 	}
-	var req struct {
-		Model string `json:"model"`
-	}
-	if err := json.Unmarshal(body, &req); err != nil {
-		writeError(w, http.StatusBadRequest, "relay: body is not JSON")
-		return
-	}
-	candidates, err := st.router.Candidates(req.Model)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "relay: "+err.Error())
-		return
-	}
-	model := NormalizeModel(req.Model)
+	model := NormalizeModel(reqModel)
+	r = r.WithContext(withRequestModel(r.Context(), model))
 
 	// Each pass tries every candidate once. If none gave any HTTP answer the
 	// network is down (seen: 30 min with DNS failing for internal and external
@@ -64,7 +52,7 @@ func (s *Server) proxy(w http.ResponseWriter, r *http.Request, st *state) {
 	// since nothing has reached the client yet.
 	var held time.Time
 	for n := 0; ; n++ {
-		resp, name, trail, answered := s.pass(r, st, req.Model, model, candidates, body)
+		resp, name, trail, answered := s.pass(r, st, reqModel, model, candidates, body)
 		if r.Context().Err() != nil {
 			if resp != nil {
 				resp.Body.Close()
@@ -73,10 +61,10 @@ func (s *Server) proxy(w http.ResponseWriter, r *http.Request, st *state) {
 		}
 		if resp != nil {
 			if !held.IsZero() {
-				s.log.Info("network outage: request recovered", "model", req.Model,
+				s.log.Info("network outage: request recovered", "model", reqModel,
 					"held", time.Since(held).Round(time.Second))
 			}
-			s.relay(w, r, resp, st, name, req.Model, trail, start)
+			s.relay(w, r, resp, st, name, reqModel, trail, start)
 			return
 		}
 		wait := *st.cfg.Network.OutageWait
@@ -89,7 +77,7 @@ func (s *Server) proxy(w http.ResponseWriter, r *http.Request, st *state) {
 		if held.IsZero() {
 			held = time.Now()
 			if wait > 0 {
-				s.log.Warn("network outage: holding request", "model", req.Model, "max", wait,
+				s.log.Warn("network outage: holding request", "model", reqModel, "max", wait,
 					"tried", strings.Join(trail, " > "))
 			}
 		}
@@ -104,6 +92,30 @@ func (s *Server) proxy(w http.ResponseWriter, r *http.Request, st *state) {
 			return
 		}
 	}
+}
+
+// readModelRequest reads the body and finds the providers for its model,
+// answering the client itself (ok false) when either fails.
+func readModelRequest(w http.ResponseWriter, r *http.Request, st *state) (body []byte, model string,
+	candidates []string, ok bool) {
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxRequestBody))
+	if err != nil {
+		writeError(w, http.StatusRequestEntityTooLarge, "relay: read body: "+err.Error())
+		return nil, "", nil, false
+	}
+	var req struct {
+		Model string `json:"model"`
+	}
+	if err := json.Unmarshal(body, &req); err != nil {
+		writeError(w, http.StatusBadRequest, "relay: body is not JSON")
+		return nil, "", nil, false
+	}
+	candidates, err = st.router.Candidates(req.Model)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "relay: "+err.Error())
+		return nil, "", nil, false
+	}
+	return body, req.Model, candidates, true
 }
 
 // outageBackoff paces re-tries while the network is down; a var for tests.
@@ -308,23 +320,8 @@ func (s *Server) sendRefreshing(r *http.Request, l *lane, p *provider, body []by
 func (s *Server) relay(w http.ResponseWriter, r *http.Request, resp *http.Response, st *state,
 	name, model string, trail []string, start time.Time) {
 	defer resp.Body.Close()
-	copyHeaders(w.Header(), resp.Header)
 	messages := isMessagesStream(r, resp)
-	if messages {
-		w.Header().Del("Content-Length") // the relay may reorder or drop events
-	}
-	if resp.StatusCode == statusOriginTimeout {
-		// Cloudflare's 524 carries "Retry-After: 120", and Claude Code gives up
-		// on any Retry-After above 60s (tengu_api_retry_after_too_long), so a
-		// slow origin became a final error. A fresh request is the right answer.
-		w.Header().Del("Retry-After")
-		w.Header().Set("X-Should-Retry", "true")
-	}
-	w.Header().Set("X-Relay-Provider", name)
-	if len(trail) > 0 {
-		w.Header().Set("X-Relay-Failover", strings.Join(append(trail, name), " > "))
-	}
-	w.WriteHeader(resp.StatusCode)
+	writeRelayHeaders(w, resp, name, trail, messages)
 
 	coolOnce := false
 	cool := func() {
@@ -351,6 +348,32 @@ func (s *Server) relay(w http.ResponseWriter, r *http.Request, resp *http.Respon
 		})
 	}
 	attrs = append(attrs, "ms", time.Since(start).Milliseconds())
+	s.logRelayEnd(r, err, messages, attrs)
+}
+
+// writeRelayHeaders sends the upstream's status and headers plus the relay's own.
+func writeRelayHeaders(w http.ResponseWriter, resp *http.Response, name string, trail []string, messages bool) {
+	copyHeaders(w.Header(), resp.Header)
+	if messages {
+		w.Header().Del("Content-Length") // the relay may reorder or drop events
+	}
+	if resp.StatusCode == statusOriginTimeout {
+		// Cloudflare's 524 carries "Retry-After: 120", and Claude Code gives up
+		// on any Retry-After above 60s (tengu_api_retry_after_too_long), so a
+		// slow origin became a final error. A fresh request is the right answer.
+		w.Header().Del("Retry-After")
+		w.Header().Set("X-Should-Retry", "true")
+	}
+	w.Header().Set("X-Relay-Provider", name)
+	if len(trail) > 0 {
+		w.Header().Set("X-Relay-Failover", strings.Join(append(trail, name), " > "))
+	}
+	w.WriteHeader(resp.StatusCode)
+}
+
+// logRelayEnd logs how a relayed response ended and, for a broken non-Messages
+// stream, aborts the client connection.
+func (s *Server) logRelayEnd(r *http.Request, err error, messages bool, attrs []any) {
 	var cw clientWriteError
 	switch {
 	case err == nil:

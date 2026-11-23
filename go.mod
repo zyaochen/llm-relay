@@ -1,4 +1,4 @@
-module github.com/chenziyaos/llm-relay
+module github.com/zyaochen/llm-relay
 
 go 1.26.1
 

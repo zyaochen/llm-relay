@@ -122,6 +122,30 @@ func (d *HedgedDialer) DialTLSContext(ctx context.Context, network, addr string)
 
 	stats := d.Stats(host)
 	start := time.Now()
+	conn, started, err := d.race(ctx, cfg, ips, host, port, stats)
+	switch {
+	case errors.Is(err, errDialTimeout):
+		stats.Failures.Add(1)
+		return nil, fmt.Errorf("tls dial %s: no handshake finished within %s (%d attempts): %w",
+			addr, cfg.ConnectTimeout, started, ctx.Err())
+	case err != nil:
+		stats.Failures.Add(1)
+		return nil, fmt.Errorf("tls dial %s: all %d attempts failed: %w", addr, started, err)
+	}
+	ms := time.Since(start).Milliseconds()
+	stats.Dials.Add(1)
+	stats.LastMs.Store(ms)
+	stats.TotalMs.Add(ms)
+	return conn, nil
+}
+
+var errDialTimeout = errors.New("no handshake finished in time")
+
+// race runs handshakes to ips, starting another one every hedge_after (or at
+// once when every running one has failed) up to max_parallel; the first to
+// finish wins and the others are closed. It reports how many it started.
+func (d *HedgedDialer) race(ctx context.Context, cfg NetworkConfig, ips []string, host, port string,
+	stats *DialStats) (net.Conn, int, error) {
 	attempts, cancelAttempts := context.WithCancel(ctx)
 	defer cancelAttempts()
 	results := make(chan dialResult, cfg.MaxParallel)
@@ -145,11 +169,7 @@ func (d *HedgedDialer) DialTLSContext(ctx context.Context, network, addr string)
 			if r.err == nil {
 				cancelAttempts()
 				go closeLosers(results, started-failed-1)
-				ms := time.Since(start).Milliseconds()
-				stats.Dials.Add(1)
-				stats.LastMs.Store(ms)
-				stats.TotalMs.Add(ms)
-				return r.conn, nil
+				return r.conn, started, nil
 			}
 			failed++
 			stats.AttemptFails.Add(1)
@@ -159,14 +179,12 @@ func (d *HedgedDialer) DialTLSContext(ctx context.Context, network, addr string)
 			if failed < started {
 				continue // others still running
 			}
-			if started < cfg.MaxParallel {
-				launch() // everything failed fast; try the next address now
-				stats.Hedges.Add(1)
-				hedge.Reset(cfg.HedgeAfter)
-				continue
+			if started == cfg.MaxParallel {
+				return nil, started, firstErr
 			}
-			stats.Failures.Add(1)
-			return nil, fmt.Errorf("tls dial %s: all %d attempts failed: %w", addr, started, firstErr)
+			launch() // everything failed fast; try the next address now
+			stats.Hedges.Add(1)
+			hedge.Reset(cfg.HedgeAfter)
 		case <-hedge.C:
 			if started < cfg.MaxParallel {
 				launch()
@@ -175,9 +193,7 @@ func (d *HedgedDialer) DialTLSContext(ctx context.Context, network, addr string)
 			}
 		case <-ctx.Done():
 			go closeLosers(results, started-failed)
-			stats.Failures.Add(1)
-			return nil, fmt.Errorf("tls dial %s: no handshake finished within %s (%d attempts): %w",
-				addr, cfg.ConnectTimeout, started, ctx.Err())
+			return nil, started, errDialTimeout
 		}
 	}
 }

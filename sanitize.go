@@ -84,38 +84,12 @@ func stripThinking(body []byte, foreignOnly bool) ([]byte, int, error) {
 	removed := 0
 	out := make([]map[string]json.RawMessage, 0, len(msgs))
 	for _, m := range msgs {
-		var role string
-		var blocks []json.RawMessage
-		// plain-string content has no thinking blocks
-		if json.Unmarshal(m["role"], &role) != nil || role != "assistant" ||
-			json.Unmarshal(m["content"], &blocks) != nil {
-			out = append(out, m)
-			continue
+		keep, n, err := stripMessage(m, foreignOnly)
+		if err != nil {
+			return nil, 0, err
 		}
-		kept := make([]json.RawMessage, 0, len(blocks))
-		for _, b := range blocks {
-			var head struct {
-				Type      string `json:"type"`
-				Signature string `json:"signature"`
-			}
-			if json.Unmarshal(b, &head) == nil && dropThinking(head.Type, head.Signature, foreignOnly) {
-				continue
-			}
-			kept = append(kept, b)
-		}
-		removed += len(blocks) - len(kept)
-		switch {
-		case len(kept) == len(blocks):
-			out = append(out, m)
-		case len(kept) == 0:
-			// A thinking-only turn: drop it. The API merges the neighbouring
-			// same-role turns, and empty content would be rejected anyway.
-		default:
-			content, err := json.Marshal(kept)
-			if err != nil {
-				return nil, 0, err
-			}
-			m["content"] = content
+		removed += n
+		if keep {
 			out = append(out, m)
 		}
 	}
@@ -130,6 +104,44 @@ func stripThinking(body []byte, foreignOnly bool) ([]byte, int, error) {
 	top["messages"] = enc
 	clean, err := json.Marshal(top)
 	return clean, removed, err
+}
+
+// stripMessage removes dropped thinking blocks from one message in place. It
+// reports whether the message stays and how many blocks it lost.
+func stripMessage(m map[string]json.RawMessage, foreignOnly bool) (bool, int, error) {
+	var role string
+	var blocks []json.RawMessage
+	// plain-string content has no thinking blocks
+	if json.Unmarshal(m["role"], &role) != nil || role != "assistant" ||
+		json.Unmarshal(m["content"], &blocks) != nil {
+		return true, 0, nil
+	}
+	kept := make([]json.RawMessage, 0, len(blocks))
+	for _, b := range blocks {
+		var head struct {
+			Type      string `json:"type"`
+			Signature string `json:"signature"`
+		}
+		if json.Unmarshal(b, &head) == nil && dropThinking(head.Type, head.Signature, foreignOnly) {
+			continue
+		}
+		kept = append(kept, b)
+	}
+	removed := len(blocks) - len(kept)
+	switch {
+	case removed == 0:
+		return true, 0, nil
+	case len(kept) == 0:
+		// A thinking-only turn: drop it. The API merges the neighbouring
+		// same-role turns, and empty content would be rejected anyway.
+		return false, removed, nil
+	}
+	content, err := json.Marshal(kept)
+	if err != nil {
+		return false, 0, err
+	}
+	m["content"] = content
+	return true, removed, nil
 }
 
 func dropThinking(typ, signature string, foreignOnly bool) bool {
