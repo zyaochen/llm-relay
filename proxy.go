@@ -92,8 +92,10 @@ func (s *Server) concurrencySummary(st *state) map[string]map[string]int {
 		if p.MaxConcurrent <= 0 {
 			continue
 		}
-		l := s.limits.get(p.Name, p.MaxConcurrent)
-		out[p.Name] = map[string]int{"limit": l.limit(), "in_use": l.inUse(), "waiting": int(l.waiting.Load())}
+		l := s.limits.get(p)
+		inUse, waiting, waitingPriority := l.counts()
+		out[p.Name] = map[string]int{"limit": l.limit(), "reserved": l.reserved, "in_use": inUse,
+			"waiting": waiting, "waiting_priority": waitingPriority}
 	}
 	return out
 }

@@ -181,7 +181,7 @@ func TestStreamsIncrementallyAndRefreshesOn401(t *testing.T) {
 
 func TestRoutesByDiscoveryAndStaticModels(t *testing.T) {
 	f := newFixture(t)
-	f.srv.discover(f.srv.st.Load())
+	f.srv.discover(f.srv.st.Load(), true)
 
 	for _, model := range []string{"kimi-b", "static-b"} {
 		resp := f.do(t, "POST", "/v1/responses", clientKey, fmt.Sprintf(`{"model":%q}`, model))

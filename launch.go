@@ -35,45 +35,18 @@ type launchSpec struct {
 
 // buildLaunch turns a preset into the exact process to exec. Pure, for tests.
 func buildLaunch(cfg *Config, name string, p PresetConfig, key string, args, parentEnv []string) launchSpec {
-	drop := make(map[string]bool, len(managedEnv)+len(p.Env))
-	for _, k := range managedEnv {
-		drop[k] = true
-	}
-	for k := range p.Env {
-		drop[k] = true
-	}
-	env := make([]string, 0, len(parentEnv)+16)
-	for _, kv := range parentEnv {
-		if k, _, _ := strings.Cut(kv, "="); !drop[k] {
-			env = append(env, kv)
-		}
-	}
+	env := launchEnv(p, parentEnv)
 	set := func(k, v string) {
 		if v != "" {
 			env = append(env, k+"="+v)
 		}
 	}
-	for k, v := range p.Env {
-		set(k, v)
-	}
 	base := "http://" + cfg.Listen
 
 	if p.Client == "codex" {
-		pre := []string{
-			"-c", fmt.Sprintf("model_provider=%q", codexProvider),
-			"-c", fmt.Sprintf("model_providers.%s.name=%q", codexProvider, "llm-relay"),
-			"-c", fmt.Sprintf("model_providers.%s.base_url=%q", codexProvider, base+"/v1"),
-			"-c", fmt.Sprintf("model_providers.%s.env_key=%q", codexProvider, "LLM_RELAY_KEY"),
-			"-c", fmt.Sprintf("model_providers.%s.wire_api=%q", codexProvider, "responses"),
-			"-c", fmt.Sprintf("model_providers.%s.supports_websockets=false", codexProvider),
-			"-m", p.Model,
-		}
-		if p.ReasoningEffort != "" {
-			pre = append(pre, "-c", fmt.Sprintf("model_reasoning_effort=%q", p.ReasoningEffort))
-		}
 		set("LLM_RELAY_KEY", key)
 		return launchSpec{
-			argv:   append(append([]string{"codex"}, pre...), args...),
+			argv:   append(append([]string{"codex"}, codexArgs(p, base)...), args...),
 			env:    env,
 			banner: fmt.Sprintf("llm-relay: %s -> codex via %s (model %s)", name, base, p.Model),
 		}
@@ -97,6 +70,48 @@ func buildLaunch(cfg *Config, name string, p PresetConfig, key string, args, par
 		env:    env,
 		banner: fmt.Sprintf("llm-relay: %s -> claude via %s (model %s)", name, base, model),
 	}
+}
+
+// launchEnv is the parent environment minus every gateway-related variable
+// and the preset's own keys, plus the preset's non-empty env values.
+func launchEnv(p PresetConfig, parentEnv []string) []string {
+	drop := make(map[string]bool, len(managedEnv)+len(p.Env))
+	for _, k := range managedEnv {
+		drop[k] = true
+	}
+	for k := range p.Env {
+		drop[k] = true
+	}
+	env := make([]string, 0, len(parentEnv)+16)
+	for _, kv := range parentEnv {
+		if k, _, _ := strings.Cut(kv, "="); !drop[k] {
+			env = append(env, kv)
+		}
+	}
+	for k, v := range p.Env {
+		if v != "" {
+			env = append(env, k+"="+v)
+		}
+	}
+	return env
+}
+
+// codexArgs points Codex at the relay through -c overrides, so its config
+// file needs no relay entry.
+func codexArgs(p PresetConfig, base string) []string {
+	pre := []string{
+		"-c", fmt.Sprintf("model_provider=%q", codexProvider),
+		"-c", fmt.Sprintf("model_providers.%s.name=%q", codexProvider, "llm-relay"),
+		"-c", fmt.Sprintf("model_providers.%s.base_url=%q", codexProvider, base+"/v1"),
+		"-c", fmt.Sprintf("model_providers.%s.env_key=%q", codexProvider, "LLM_RELAY_KEY"),
+		"-c", fmt.Sprintf("model_providers.%s.wire_api=%q", codexProvider, "responses"),
+		"-c", fmt.Sprintf("model_providers.%s.supports_websockets=false", codexProvider),
+		"-m", p.Model,
+	}
+	if p.ReasoningEffort != "" {
+		pre = append(pre, "-c", fmt.Sprintf("model_reasoning_effort=%q", p.ReasoningEffort))
+	}
+	return pre
 }
 
 // splitPreset takes a leading preset name off args. A leading non-flag that
@@ -192,18 +207,16 @@ func readClientKey(cfg *Config) (string, error) {
 	return strings.TrimSpace(string(raw)), nil
 }
 
-// ensureRelay starts the launchd agent if the relay is not answering, rather
-// than letting every request of the session fail.
+// ensureRelay starts the background service if the relay is not answering,
+// rather than letting every request of the session fail.
 func ensureRelay(configPath string) error {
 	healthy := func() bool { return call(configPath, "GET", "/relay/health", func([]byte) error { return nil }) == nil }
 	if healthy() {
 		return nil
 	}
-	target := fmt.Sprintf("gui/%d/%s", os.Getuid(), agentLabel)
-	fmt.Fprintf(os.Stderr, "llm-relay: relay not answering; starting %s\n", target)
-	if out, err := exec.Command("launchctl", "kickstart", target).CombinedOutput(); err != nil {
-		return fmt.Errorf("relay is down and could not be started (%s); run `llm-relay install-agent`: %w",
-			strings.TrimSpace(string(out)), err)
+	fmt.Fprintln(os.Stderr, "llm-relay: relay not answering; starting the background service")
+	if err := runAgent(false); err != nil {
+		return fmt.Errorf("relay is down and could not be started; run `llm-relay install-agent`: %w", err)
 	}
 	for range 20 {
 		time.Sleep(500 * time.Millisecond)
@@ -211,7 +224,7 @@ func ensureRelay(configPath string) error {
 			return nil
 		}
 	}
-	return errors.New("relay did not come up within 10s; see ~/Library/Logs/llm-relay.log")
+	return fmt.Errorf("relay did not come up within 10s; see %s", defaultLogPath())
 }
 
 // warnUnknownModels flags preset models no provider advertises (stale or

@@ -17,11 +17,23 @@ thinking signatures, SSE events and tool calls pass through byte-for-byte.
 go build -trimpath -o ~/.local/bin/llm-relay .
 llm-relay init            # ~/.config/llm-relay/{config.yaml,client.key}, never overwrites
 $EDITOR ~/.config/llm-relay/config.yaml
-llm-relay install-agent   # launchd: starts at login, restarts on crash
+llm-relay install-agent   # macOS: launchd agent; Linux: systemd user unit. Starts at login, restarts on crash
 llm-relay routes          # which provider serves which model
 ```
 
-Logs: `~/Library/Logs/llm-relay.log` (one line per request; never tokens).
+Logs: `~/Library/Logs/llm-relay.log` on macOS,
+`~/.local/state/llm-relay/llm-relay.log` on Linux — one line per request,
+never tokens. The relay rotates it at 20 MB and keeps 3 old files; crashes
+land in `llm-relay.stderr.log` next to it.
+
+`install-agent` waits (up to `-wait 2m`) for a moment with no request in
+flight before it reloads a running agent, because reloading cuts open streams;
+`-force` reinstalls anyway.
+
+On Linux the service does not see your shell's exports: give upstream secrets
+through `auth.cmd` (e.g. `[secret-tool, lookup, service, llm-relay-newgw]` or
+`[cat, ~/.config/llm-relay/newgw.token]`), and run `loginctl enable-linger`
+if the relay should keep running after you log out.
 
 ## Add a gateway
 
@@ -40,7 +52,11 @@ providers:
     # models: [some-model]       # served in addition to discovered ones
 ```
 
-Store the secret once: `security add-generic-password -U -s llm-relay/newgw -a "$USER" -w`.
+Store the secret once (macOS Keychain): `security add-generic-password -U -s llm-relay/newgw -a "$USER" -w`.
+
+Model lists are polled every 10 minutes. A provider whose slots are all busy
+is asked again after a minute; a failing one backs off from 1 minute up to
+10, with one warning per failure streak and one line when it recovers.
 
 Each request's model (a `[1m]`-style suffix is ignored) gets an ordered
 candidate list, shown by `llm-relay routes`:
@@ -77,6 +93,10 @@ routes:
   - {match: "claude-*", providers: [gw-a, gw-b]}
 ```
 
+A second key for the same gateway counts as a second provider: same
+`base_url`, its own `auth` and `max_concurrent`. That doubles the concurrency
+cap as well as giving the model somewhere to fail over to.
+
 ## Lossy networks
 
 Some gateways sit behind slow or lossy paths (measured to one cross-border,
@@ -90,7 +110,7 @@ CLIs don't fail:
 | Health pings | HTTP/2 connections quiet for 45 s are pinged; no pong in 20 s → dropped before a request lands on them | fixed |
 | Lanes | each provider gets independent connections; a new request avoids a lane that has requests in flight but no byte for 5 s, then picks the least busy; quiet traffic stays on lane 0 with the others warm as standbys | `connections: 2` (1–4) |
 | Same-provider retry | no response at all (reset, EOF, dial failure) → resend to the same provider, on another lane, before failing over | `retries: 1` |
-| Concurrency limit | at most `max_concurrent` requests in flight per provider (a whole stream holds a slot); the rest queue FIFO in the relay instead of drawing the gateway's 429. A concurrency 429 that still arrives (another client on the same key) is resent to the same provider for up to 60 s, no cooldown, no failover | `providers[].max_concurrent` (e.g. 4) |
+| Concurrency limit | at most `max_concurrent` requests in flight per provider (a whole stream holds a slot); the rest queue FIFO in the relay instead of drawing the gateway's 429. A concurrency 429 that still arrives (another client on the same key) is resent to the same provider for up to 60 s, no cooldown, no failover. Models matching `priority_models` are served before others, and `reserved_slots` of the cap are kept for them | `providers[].max_concurrent` (e.g. 4), `priority_models`, `reserved_slots` |
 | Outage hold | no provider gives any HTTP answer (network down: DNS/TLS failing everywhere) → the request is held and retried (1 s doubling to 10 s) until the network is back; the client just sees a slow reply | `outage_wait: 3m` (0 = fail fast) |
 | Stale-if-error DNS | resolver fails → the last good answer (≤ 24 h) is used; counted as `stale_dns` in status | — |
 | Retryable failure | still unreachable after the hold → `503` + `Retry-After: 3` + `x-should-retry: true`, which Claude Code and Codex retry (10 tries for Claude Code, so a held relay stretches its tolerance from a few minutes to ~35) | — |
@@ -99,6 +119,23 @@ CLIs don't fail:
 `last_upstream_ok`, which tells a network outage from a broken gateway: if both
 gateways stopped answering at once and `stale_dns` climbs, it is the local
 network (VPN / Wi-Fi), not the gateways.
+
+**Priority.** Claude Code's background calls (titles, summaries, Explore
+subagents on haiku) outnumber the interactive turn about 2 to 1. Measured over
+four days with a cap of 4: 8223 requests queued for a slot, median 10.6 s,
+27 hours in total, and the main opus turn was among them 766 times. Put the
+interactive model first:
+
+```yaml
+providers:
+  - name: gw-a
+    max_concurrent: 4
+    priority_models: ["claude-opus-*"]   # served before other queued requests
+    reserved_slots: 1                    # never given to other models
+```
+
+`llm-relay status` shows `reserved` and `waiting_priority` per provider; each
+slot wait is logged with its model and `priority=true|false`.
 
 Measure a path with `llm-relay probe [-n 20] <provider>` (fresh single vs
 hedged handshakes); `llm-relay status` shows per-provider dial counters — few
@@ -184,11 +221,12 @@ never leave it.
 
 | Symptom | Check |
 |---|---|
-| `relay not reachable` | `launchctl kickstart -k gui/$(id -u)/io.github.chenziyaos.llm-relay`; if unloaded, `llm-relay install-agent` |
+| `relay not reachable` | macOS: `launchctl kickstart -k gui/$(id -u)/io.github.chenziyaos.llm-relay`; Linux: `systemctl --user restart llm-relay`; if not installed, `llm-relay install-agent` |
+| slow or failing answers | `llm-relay stats [-since 24h]`: per-model latency (p50/p90) and slot waits, per-provider 429/5xx/524, failovers, retries, mid-stream losses, and how many answers may have been billed twice |
 | `no provider serves model` | `llm-relay routes`; add a `routes` entry or `default_provider` |
 | stuck on the backup gateway | `llm-relay routes` shows `[cooling …]`; `llm-relay reset` |
 | 401 from a gateway | credential command output: run the `auth.cmd` by hand |
-| config edit ignored | `grep "reload rejected" ~/Library/Logs/llm-relay.log` |
+| config edit ignored | `grep "reload rejected"` in the log |
 | upgrading the binary | `go build -trimpath -o ~/.local/bin/llm-relay . && llm-relay restart` — waits up to 2 min for a moment with no request in flight, else gives up; `-force` restarts anyway, draining in-flight streams up to 90 s while new connections wait (clients retry) |
 
 ## Develop

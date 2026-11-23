@@ -4,13 +4,11 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
-	"os"
-	"os/exec"
 	"time"
 )
 
 // restart waits for a moment with no client request in flight, then has
-// launchd restart the agent, so updating the relay does not cut anyone's
+// the service manager restart the agent, so updating the relay does not cut anyone's
 // stream. Without -force it gives up if that moment does not come within
 // -wait: a forced restart drains running requests (up to drainTimeout), but
 // while it drains no new connection is accepted, and a measured 84s drain
@@ -35,11 +33,7 @@ func restart(configPath string, args []string) error {
 	default:
 		return fmt.Errorf("still busy after %s; not restarting (try again, raise -wait, or add -force)", *wait)
 	}
-	target := fmt.Sprintf("gui/%d/%s", os.Getuid(), agentLabel)
-	if out, err := exec.Command("launchctl", "kickstart", "-k", target).CombinedOutput(); err != nil {
-		return fmt.Errorf("launchctl kickstart: %w: %s", err, out)
-	}
-	return nil
+	return runAgent(true)
 }
 
 // waitIdle polls the relay's health until active_requests is 0 or wait ends.

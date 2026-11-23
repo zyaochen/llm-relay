@@ -17,7 +17,6 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"sort"
@@ -45,6 +44,8 @@ relay:
   key            print the client key local tools must present
   status         show relay health
   routes         show each model's providers in failover order, and active cooldowns
+  stats [-since 24h] [-log path]
+                 per-model latency and slot waits, per-provider failures, from the log
   reset [name]   clear cooldowns (all, or one provider) so traffic goes back now
   probe [-n N] <provider>
                  compare fresh single vs hedged TLS handshakes to a provider
@@ -52,7 +53,9 @@ relay:
   restart [-wait 2m] [-force]
                  restart the agent once no client request is in flight; gives up after
                  -wait unless -force (then in-flight streams get up to 90s to drain)
-  install-agent  install and (re)start the launchd agent ` + agentLabel + `
+  install-agent [-wait 2m] [-force]
+                 install and (re)start the background service (launchd agent ` + agentLabel + `
+                 on macOS, systemd user unit ` + systemdUnitName + ` on Linux) once the relay is idle
 `
 )
 
@@ -61,7 +64,7 @@ func main() {
 	configPath := fl.String("config", DefaultConfigPath(), "config file")
 	fl.Usage = func() { fmt.Fprint(os.Stderr, usage) }
 	_ = fl.Parse(os.Args[1:]) // ExitOnError exits on failure
-	takesArgs := map[string]bool{"reset": true, "probe": true, "restart": true, "run": true, "next": true}
+	takesArgs := map[string]bool{"reset": true, "probe": true, "restart": true, "run": true, "next": true, "stats": true, "install-agent": true}
 	if fl.NArg() == 0 || (fl.NArg() > 1 && !takesArgs[fl.Arg(0)]) {
 		fl.Usage()
 		os.Exit(2)
@@ -83,6 +86,8 @@ func main() {
 		err = printKey(*configPath)
 	case "status":
 		err = call(*configPath, http.MethodGet, "/relay/health", printBody)
+	case "stats":
+		err = stats(fl.Args()[1:])
 	case "routes":
 		err = call(*configPath, http.MethodGet, "/relay/routes", printRoutes)
 	case "reset":
@@ -94,7 +99,7 @@ func main() {
 	case "reload":
 		err = call(*configPath, http.MethodPost, "/relay/reload", printBody)
 	case "install-agent":
-		err = installAgent(*configPath)
+		err = installAgent(*configPath, fl.Args()[1:])
 	default:
 		fl.Usage()
 		os.Exit(2)
@@ -110,7 +115,16 @@ func serve(configPath string) error {
 	if os.Getenv("LLM_RELAY_DEBUG") != "" {
 		opts.Level = slog.LevelDebug
 	}
-	log := slog.New(slog.NewTextHandler(os.Stderr, opts))
+	var out io.Writer = os.Stderr
+	if p := os.Getenv("LLM_RELAY_LOG"); p != "" { // set by install-agent
+		f, err := openRotating(p, logMaxBytes, logKeep)
+		if err != nil {
+			return fmt.Errorf("open log: %w", err)
+		}
+		defer f.Close()
+		out = f
+	}
+	log := slog.New(slog.NewTextHandler(out, opts))
 	srv, err := NewServer(configPath, log)
 	if err != nil {
 		return err
@@ -192,8 +206,7 @@ func call(configPath, method, path string, show func([]byte) error) error {
 	}
 	resp, err := (&http.Client{Timeout: 10 * time.Second}).Do(req)
 	if err != nil {
-		return fmt.Errorf("relay not reachable on %s (launchctl kickstart -k gui/%d/%s): %w",
-			cfg.Listen, os.Getuid(), agentLabel, err)
+		return fmt.Errorf("relay not reachable on %s (%s): %w", cfg.Listen, agentHint(), err)
 	}
 	defer resp.Body.Close()
 	body, err := io.ReadAll(resp.Body)
@@ -248,66 +261,4 @@ func printRoutes(b []byte) error {
 		fmt.Fprintf(tw, "%s\t%s\n", m, chain[m])
 	}
 	return tw.Flush()
-}
-
-const plistTemplate = `<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key><string>%s</string>
-  <key>ProgramArguments</key>
-  <array><string>%s</string><string>-config</string><string>%s</string><string>serve</string></array>
-  <key>RunAtLoad</key><true/>
-  <key>KeepAlive</key><true/>
-  <key>ThrottleInterval</key><integer>5</integer>
-  <key>ExitTimeOut</key><integer>100</integer>
-  <key>StandardOutPath</key><string>%s</string>
-  <key>StandardErrorPath</key><string>%s</string>
-  <key>EnvironmentVariables</key>
-  <dict>
-    <key>PATH</key><string>%s</string>
-    <key>HOME</key><string>%s</string>
-  </dict>
-</dict>
-</plist>
-`
-
-func installAgent(configPath string) error {
-	if _, err := LoadConfig(configPath); err != nil {
-		return fmt.Errorf("refusing to install with a broken config: %w", err)
-	}
-	bin, err := os.Executable()
-	if err != nil {
-		return err
-	}
-	if bin, err = filepath.EvalSymlinks(bin); err != nil {
-		return err
-	}
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return err
-	}
-	absConfig, err := filepath.Abs(configPath)
-	if err != nil {
-		return err
-	}
-	logFile := filepath.Join(home, "Library/Logs/llm-relay.log")
-	path := strings.Join([]string{filepath.Join(home, ".local/bin"), "/opt/homebrew/bin",
-		"/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"}, ":")
-	plist := fmt.Sprintf(plistTemplate, agentLabel, bin, absConfig, logFile, logFile, path, home)
-	plistPath := filepath.Join(home, "Library/LaunchAgents", agentLabel+".plist")
-	if err := os.WriteFile(plistPath, []byte(plist), 0o644); err != nil {
-		return err
-	}
-
-	domain := fmt.Sprintf("gui/%d", os.Getuid())
-	// bootout fails when the agent is not loaded yet; that is the expected first-install case.
-	if out, err := exec.Command("launchctl", "bootout", domain+"/"+agentLabel).CombinedOutput(); err != nil {
-		fmt.Fprintf(os.Stderr, "launchctl bootout (ok on first install): %s", out)
-	}
-	if out, err := exec.Command("launchctl", "bootstrap", domain, plistPath).CombinedOutput(); err != nil {
-		return fmt.Errorf("launchctl bootstrap: %w: %s", err, out)
-	}
-	fmt.Printf("installed %s\nlogs: %s\n", plistPath, logFile)
-	return nil
 }

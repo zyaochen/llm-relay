@@ -129,6 +129,32 @@ type ProviderConfig struct {
 	// MaxConcurrent caps in-flight requests to this provider (0 = unlimited);
 	// extra requests queue in the relay instead of drawing a 429.
 	MaxConcurrent int `yaml:"max_concurrent"`
+	// PriorityModels are model globs whose requests are served before others
+	// when requests queue for a slot (the interactive model over background ones).
+	PriorityModels []string `yaml:"priority_models"`
+	// ReservedSlots of MaxConcurrent are only given to priority models.
+	ReservedSlots int `yaml:"reserved_slots"`
+}
+
+func (p *ProviderConfig) normalizeLimits() error {
+	switch {
+	case p.MaxConcurrent < 0:
+		return errors.New("max_concurrent must not be negative")
+	case p.ReservedSlots < 0:
+		return errors.New("reserved_slots must not be negative")
+	case p.ReservedSlots > 0 && p.ReservedSlots >= p.MaxConcurrent:
+		return errors.New("reserved_slots must be below max_concurrent")
+	case p.ReservedSlots > 0 && len(p.PriorityModels) == 0:
+		return errors.New("reserved_slots needs priority_models")
+	case len(p.PriorityModels) > 0 && p.MaxConcurrent == 0:
+		return errors.New("priority_models needs max_concurrent")
+	}
+	for _, g := range p.PriorityModels {
+		if _, err := path.Match(g, ""); err != nil {
+			return fmt.Errorf("priority_models: bad glob %q: %w", g, err)
+		}
+	}
+	return nil
 }
 
 // AuthConfig says where the upstream credential comes from. Exactly one of
@@ -176,52 +202,12 @@ func (c *Config) normalize() error {
 		c.Listen = defaultListen
 	}
 	c.ClientKeyFile = expandHome(c.ClientKeyFile)
-	if len(c.Providers) == 0 {
-		return errors.New("at least one provider is required")
+	seen, err := c.normalizeProviders()
+	if err != nil {
+		return err
 	}
-
-	seen := make(map[string]bool, len(c.Providers))
-	for i := range c.Providers {
-		p := &c.Providers[i]
-		if p.Name == "" {
-			return fmt.Errorf("providers[%d]: name is required", i)
-		}
-		if seen[p.Name] {
-			return fmt.Errorf("providers[%d]: duplicate name %q", i, p.Name)
-		}
-		seen[p.Name] = true
-
-		u, err := url.Parse(p.BaseURL)
-		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
-			return fmt.Errorf("provider %s: base_url must be an absolute http(s) URL", p.Name)
-		}
-		p.BaseURL = strings.TrimRight(p.BaseURL, "/")
-
-		if err := p.Auth.normalize(); err != nil {
-			return fmt.Errorf("provider %s: %w", p.Name, err)
-		}
-		if p.MaxConcurrent < 0 {
-			return fmt.Errorf("provider %s: max_concurrent must not be negative", p.Name)
-		}
-	}
-
-	for i := range c.Routes {
-		r := &c.Routes[i]
-		if r.Provider != "" {
-			r.Providers = append([]string{r.Provider}, r.Providers...)
-			r.Provider = ""
-		}
-		if len(r.Providers) == 0 {
-			return fmt.Errorf("routes[%d]: provider or providers is required", i)
-		}
-		for _, p := range r.Providers {
-			if !seen[p] {
-				return fmt.Errorf("routes[%d]: unknown provider %q", i, p)
-			}
-		}
-		if _, err := path.Match(r.Match, ""); err != nil {
-			return fmt.Errorf("routes[%d]: bad glob %q: %w", i, r.Match, err)
-		}
+	if err := c.normalizeRoutes(seen); err != nil {
+		return err
 	}
 	if c.DefaultProvider != "" && !seen[c.DefaultProvider] {
 		return fmt.Errorf("default_provider: unknown provider %q", c.DefaultProvider)
@@ -241,6 +227,60 @@ func (c *Config) normalize() error {
 		return err
 	}
 	return c.normalizePresets()
+}
+
+// normalizeProviders validates providers and returns the set of their names.
+func (c *Config) normalizeProviders() (map[string]bool, error) {
+	if len(c.Providers) == 0 {
+		return nil, errors.New("at least one provider is required")
+	}
+	seen := make(map[string]bool, len(c.Providers))
+	for i := range c.Providers {
+		p := &c.Providers[i]
+		if p.Name == "" {
+			return nil, fmt.Errorf("providers[%d]: name is required", i)
+		}
+		if seen[p.Name] {
+			return nil, fmt.Errorf("providers[%d]: duplicate name %q", i, p.Name)
+		}
+		seen[p.Name] = true
+
+		u, err := url.Parse(p.BaseURL)
+		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+			return nil, fmt.Errorf("provider %s: base_url must be an absolute http(s) URL", p.Name)
+		}
+		p.BaseURL = strings.TrimRight(p.BaseURL, "/")
+
+		if err := p.Auth.normalize(); err != nil {
+			return nil, fmt.Errorf("provider %s: %w", p.Name, err)
+		}
+		if err := p.normalizeLimits(); err != nil {
+			return nil, fmt.Errorf("provider %s: %w", p.Name, err)
+		}
+	}
+	return seen, nil
+}
+
+func (c *Config) normalizeRoutes(providers map[string]bool) error {
+	for i := range c.Routes {
+		r := &c.Routes[i]
+		if r.Provider != "" {
+			r.Providers = append([]string{r.Provider}, r.Providers...)
+			r.Provider = ""
+		}
+		if len(r.Providers) == 0 {
+			return fmt.Errorf("routes[%d]: provider or providers is required", i)
+		}
+		for _, p := range r.Providers {
+			if !providers[p] {
+				return fmt.Errorf("routes[%d]: unknown provider %q", i, p)
+			}
+		}
+		if _, err := path.Match(r.Match, ""); err != nil {
+			return fmt.Errorf("routes[%d]: bad glob %q: %w", i, r.Match, err)
+		}
+	}
+	return nil
 }
 
 func (a *AuthConfig) normalize() error {

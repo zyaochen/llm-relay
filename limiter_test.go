@@ -190,11 +190,11 @@ func TestKeepWarmNeverTakesAClientSlot(t *testing.T) {
 }
 
 func TestLimiterBasics(t *testing.T) {
-	if r, ok := newLimiter(0).tryAcquire(); !ok || r == nil {
+	if r, ok := newLimiter(0, 0).tryAcquire(); !ok || r == nil {
 		t.Fatal("unlimited limiter must always grant")
 	}
-	l := newLimiter(1)
-	release, _, err := l.acquire(context.Background())
+	l := newLimiter(1, 0)
+	release, _, err := l.acquire(context.Background(), false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -203,18 +203,188 @@ func TestLimiterBasics(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
-	if _, _, err := l.acquire(ctx); err == nil {
+	if _, _, err := l.acquire(ctx, false); err == nil {
 		t.Fatal("acquire must give up with its context")
 	}
 	release()
 	release() // idempotent
-	if l.inUse() != 0 {
-		t.Fatalf("in use = %d after release", l.inUse())
+	if inUse, waiting, _ := l.counts(); inUse != 0 || waiting != 0 {
+		t.Fatalf("in use = %d, waiting = %d after release", inUse, waiting)
 	}
 	var ls limiters
-	a := ls.get("p", 2)
-	if ls.get("p", 2) != a || ls.get("p", 3) == a {
-		t.Error("limiter must be reused for the same limit and replaced when it changes")
+	p := ProviderConfig{Name: "p", MaxConcurrent: 2}
+	a := ls.get(p)
+	p3, pr := p, p
+	p3.MaxConcurrent = 3
+	pr.ReservedSlots = 1
+	if ls.get(p) != a || ls.get(p3) == a || ls.get(pr) == ls.get(p3) {
+		t.Error("limiter must be reused for the same limits and replaced when they change")
+	}
+}
+
+// waitGranted acquires in the background and reports the order slots arrive.
+func waitGranted(t *testing.T, l *limiter, priority bool, name string, order chan<- string) {
+	t.Helper()
+	go func() {
+		release, _, err := l.acquire(context.Background(), priority)
+		if err != nil {
+			t.Errorf("%s: %v", name, err)
+			return
+		}
+		order <- name
+		release()
+	}()
+}
+
+func waitQueued(t *testing.T, l *limiter, n int) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if _, w, _ := l.counts(); w == n {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("expected %d waiters", n)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func TestLimiterServesPriorityFirst(t *testing.T) {
+	l := newLimiter(1, 0)
+	hold, _, err := l.acquire(context.Background(), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	order := make(chan string, 3)
+	waitGranted(t, l, false, "normal-1", order)
+	waitQueued(t, l, 1)
+	waitGranted(t, l, false, "normal-2", order)
+	waitQueued(t, l, 2)
+	waitGranted(t, l, true, "priority", order)
+	waitQueued(t, l, 3)
+	hold()
+	got := []string{<-order, <-order, <-order}
+	if want := "priority normal-1 normal-2"; strings.Join(got, " ") != want {
+		t.Fatalf("grant order = %v, want %s", got, want)
+	}
+}
+
+func TestLimiterReservedSlotOnlyForPriority(t *testing.T) {
+	l := newLimiter(2, 1)
+	a, _, err := l.acquire(context.Background(), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	if _, _, err := l.acquire(ctx, false); err == nil {
+		t.Fatal("a normal request took the reserved slot")
+	}
+	if _, ok := l.tryAcquire(); ok {
+		t.Fatal("keep-warm took the reserved slot")
+	}
+	b, waited, err := l.acquire(context.Background(), true)
+	if err != nil || waited != 0 {
+		t.Fatalf("priority request should get the reserved slot at once: waited=%v err=%v", waited, err)
+	}
+	a()
+	b()
+	if inUse, waiting, _ := l.counts(); inUse != 0 || waiting != 0 {
+		t.Fatalf("leaked: in use %d, waiting %d", inUse, waiting)
+	}
+}
+
+func TestLimiterCancelledWaiterPassesSlotOn(t *testing.T) {
+	l := newLimiter(1, 0)
+	hold, _, err := l.acquire(context.Background(), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	gone := make(chan error, 1)
+	go func() {
+		_, _, err := l.acquire(ctx, true)
+		gone <- err
+	}()
+	waitQueued(t, l, 1)
+	order := make(chan string, 1)
+	waitGranted(t, l, false, "next", order)
+	waitQueued(t, l, 2)
+	cancel()
+	if err := <-gone; err == nil {
+		t.Fatal("cancelled waiter must fail")
+	}
+	hold()
+	select {
+	case <-order:
+	case <-time.After(2 * time.Second):
+		t.Fatal("slot was not passed on after the priority waiter left")
+	}
+}
+
+func TestPriorityModelSkipsTheQueueEndToEnd(t *testing.T) {
+	var mu sync.Mutex
+	var served []string
+	gate := make(chan struct{})
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("upstream read: %v", err)
+		}
+		mu.Lock()
+		served = append(served, string(b))
+		mu.Unlock()
+		if strings.Contains(string(b), "hold") {
+			<-gate
+		}
+		fmt.Fprint(w, "ok")
+	}))
+	defer up.Close()
+	t.Setenv("RELAY_TOKEN", "tok")
+	srv, err := NewServer(writeConfig(t, fmt.Sprintf(
+		"providers: [{name: a, base_url: %s, auth: {env: RELAY_TOKEN}, discover: false, models: [big, small],"+
+			" max_concurrent: 1, priority_models: [\"big*\"]}]\n"+
+			"network: {retries: 0, keep_warm: 0s, outage_wait: 0s}\n", up.URL)), slogDiscard())
+	if err != nil {
+		t.Fatal(err)
+	}
+	relay := httptest.NewServer(srv)
+	defer relay.Close()
+
+	var wg sync.WaitGroup
+	post := func(body string) {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if status, _ := postBody(t, relay.URL+"/v1/messages", []byte(body)); status != 200 {
+				t.Errorf("%s: %d", body, status)
+			}
+		}()
+	}
+	post(`{"model":"small","x":"hold"}`)
+	lim := srv.limits.get(srv.st.Load().cfg.Providers[0])
+	waitFor := func(n int) {
+		deadline := time.Now().Add(2 * time.Second)
+		for {
+			if inUse, w, _ := lim.counts(); inUse+w == n {
+				return
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("want %d requests at the limiter", n)
+			}
+			time.Sleep(time.Millisecond)
+		}
+	}
+	waitFor(1)
+	post(`{"model":"small","x":"2"}`)
+	waitFor(2)
+	post(`{"model":"big[1m]","x":"3"}`)
+	waitFor(3)
+	close(gate)
+	wg.Wait()
+	if len(served) != 3 || !strings.Contains(served[1], "big") {
+		t.Fatalf("priority model should be served right after the holder: %q", served)
 	}
 }
 
@@ -258,5 +428,28 @@ func TestConcurrency429GivesUpAfterBound(t *testing.T) {
 	}
 	if time.Since(start) > 2*time.Second {
 		t.Errorf("gave up too late: %v", time.Since(start))
+	}
+}
+
+func TestPriorityConfigValidation(t *testing.T) {
+	for _, tc := range []struct {
+		p  ProviderConfig
+		ok bool
+	}{
+		{ProviderConfig{MaxConcurrent: 4, PriorityModels: []string{"claude-opus-*"}, ReservedSlots: 1}, true},
+		{ProviderConfig{MaxConcurrent: 4, PriorityModels: []string{"claude-opus-*"}}, true},
+		{ProviderConfig{MaxConcurrent: 4, ReservedSlots: 1}, false},                                // nothing to reserve for
+		{ProviderConfig{MaxConcurrent: 2, PriorityModels: []string{"x"}, ReservedSlots: 2}, false}, // nothing left for others
+		{ProviderConfig{PriorityModels: []string{"x"}}, false},                                     // no limit, no queue
+		{ProviderConfig{MaxConcurrent: 2, PriorityModels: []string{"["}}, false},                   // bad glob
+		{ProviderConfig{MaxConcurrent: 2, PriorityModels: []string{"x"}, ReservedSlots: -1}, false},
+	} {
+		if err := tc.p.normalizeLimits(); (err == nil) != tc.ok {
+			t.Errorf("%+v: err=%v, want ok=%v", tc.p, err, tc.ok)
+		}
+	}
+	if !isPriority(ProviderConfig{PriorityModels: []string{"claude-opus-*"}}, "claude-opus-5-5[1m]") ||
+		isPriority(ProviderConfig{PriorityModels: []string{"claude-opus-*"}}, "claude-haiku-4-5") {
+		t.Error("isPriority must match normalized model ids against the globs")
 	}
 }
