@@ -63,7 +63,7 @@ func TestBuildLaunchCodex(t *testing.T) {
 		[]string{"PATH=/bin", "ANTHROPIC_BASE_URL=x"})
 	args := strings.Join(spec.argv, " ")
 	for _, frag := range []string{
-		`codex -c model_provider="llm_relay"`,
+		`codex exec -c model_provider="llm_relay"`,
 		`model_providers.llm_relay.base_url="http://` + defaultListen + `/v1"`,
 		`model_providers.llm_relay.env_key="LLM_RELAY_KEY"`,
 		`model_providers.llm_relay.wire_api="responses"`,
@@ -73,8 +73,12 @@ func TestBuildLaunchCodex(t *testing.T) {
 			t.Errorf("argv missing %q:\n%s", frag, args)
 		}
 	}
-	if !strings.HasSuffix(args, " exec hi") {
+	if !strings.HasSuffix(args, `model_reasoning_effort="high" hi`) {
 		t.Errorf("client args must come last: %s", args)
+	}
+	tui := strings.Join(buildLaunch(cfg, "cxr", cfg.Presets["cxr"], "k", []string{"--yolo"}, nil).argv, " ")
+	if !strings.HasPrefix(tui, `codex -c model_provider="llm_relay"`) || !strings.HasSuffix(tui, " --yolo") {
+		t.Errorf("interactive launch keeps overrides first: %s", tui)
 	}
 	env := envMap(spec.env)
 	if env["LLM_RELAY_KEY"] != "k" || env["ANTHROPIC_BASE_URL"] != "" {
