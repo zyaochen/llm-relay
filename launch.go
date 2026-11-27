@@ -46,7 +46,7 @@ func buildLaunch(cfg *Config, name string, p PresetConfig, key string, args, par
 	if p.Client == "codex" {
 		set("LLM_RELAY_KEY", key)
 		return launchSpec{
-			argv:   append(append([]string{"codex"}, codexArgs(p, base)...), args...),
+			argv:   codexArgv(p, base, args),
 			env:    env,
 			banner: fmt.Sprintf("llm-relay: %s -> codex via %s (model %s)", name, base, p.Model),
 		}
@@ -94,6 +94,21 @@ func launchEnv(p PresetConfig, parentEnv []string) []string {
 		}
 	}
 	return env
+}
+
+// codexExecCommands are Codex subcommands that drop top-level -c overrides
+// (codex 0.142: `codex -c ... exec` still dialed api.openai.com), so the
+// overrides must follow the subcommand instead.
+var codexExecCommands = map[string]bool{"exec": true, "e": true}
+
+// codexArgv is the full Codex command line for a preset launch.
+func codexArgv(p PresetConfig, base string, args []string) []string {
+	argv := []string{"codex"}
+	if len(args) > 0 && codexExecCommands[args[0]] {
+		argv = append(argv, args[0])
+		args = args[1:]
+	}
+	return append(append(argv, codexArgs(p, base)...), args...)
 }
 
 // codexArgs points Codex at the relay through -c overrides, so its config
